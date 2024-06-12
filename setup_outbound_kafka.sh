@@ -109,7 +109,7 @@ function configureEnv {
 # Note to self: Can validate zookeeper sees all brokers by the following command:
 # bin/zookeeper-shell.sh localhost:2181 ls /brokers/ids
 function startServerAndZookeeper {
-    if ! pgrep -f zookeeper.properties > /dev/null; then
+    if pgrep -f zookeeper.properties > /dev/null; then
         echo "Zookeeper already running."
     else
         # Start Zookeeper
@@ -126,7 +126,7 @@ function startServerAndZookeeper {
         fi
     fi
 
-    if ! pgrep -f zookeeper.properties > /dev/null; then
+    if pgrep -f server.properties > /dev/null; then
         echo "Kafka already running."
     else
         # Start Kafka
