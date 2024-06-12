@@ -34,7 +34,7 @@ The below deploys 6 kafka-brokers, 6 outbound connectors, and 12 Aerospike serve
 ## Grow the Instances
 Scale the outbound connectors by 2 and kafka servers by 1 horizontally
 ```bash
-bash -x setup_outbound_kafka.sh -o 2 -k 1 -g
+setup_outbound_kafka.sh -o 2 -k 1 -g
 ```
 
 ## Recreate Files
