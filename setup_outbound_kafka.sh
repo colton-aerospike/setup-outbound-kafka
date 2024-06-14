@@ -1,31 +1,52 @@
 #!/bin/bash
+export PS4='${BASH_SOURCE}:${LINENO}: '
+
 set -o errexit
 
 function createOutboundAndKafkaClient {
     if [[ $GROW -eq 1 ]]; then
         INVENTORY=$(aerolab inventory list -j)
+
+        OUTBOUND_DEPLOYED_CT=0
+        KAFKA_DEPLOYED_CT=0
+
         if [[ $OUTBOUND_NODE_CT -gt 0 ]]; then
             OUTBOUND_DEPLOYED_CT=$(jq -r '.Clients[] | select(.ClientName | contains("outbound-connector")).PrivateIp' <<< "$INVENTORY" | wc -l)
             echo "Growing outbound-connectors by $OUTBOUND_NODE_CT"
             aerolab client grow none -n outbound-connector -c $OUTBOUND_NODE_CT --disk=pd-ssd:110 --instance $O_INSTANCE --zone $ZONE
         fi
+
         if [[ $KAFKA_NODE_CT -gt 0 ]]; then
             KAFKA_DEPLOYED_CT=$(jq -r '.Clients[] | select(.ClientName | contains("kafka-server")).PrivateIp' <<< "$INVENTORY" | wc -l)
             echo "Growing kafka-servers by $KAFKA_NODE_CT"
             aerolab client grow none -n kafka-server -c $KAFKA_NODE_CT --disk=pd-ssd:110 --disk=local-ssd --instance $K_INSTANCE --zone $ZONE
         fi
+
         if [[ $OUTBOUND_NODE_CT -gt 0 || $KAFKA_NODE_CT -gt 0 ]]; then
+            echo "Recreating files..."
             recreateFiles 
+            echo "Running installer scripts..."
             runInstallerScripts $OUTBOUND_DEPLOYED_CT $KAFKA_DEPLOYED_CT
+            echo "Deploying Aerospike cluster..."
             deployAerospikeCluster $OUTBOUND_NODE_CT
         fi
-        return
     fi
-    echo "Creating outbound-connector instance"
-    aerolab client create none -n outbound-connector -c $OUTBOUND_NODE_CT --disk=pd-ssd:110 --instance $O_INSTANCE --zone $ZONE #--start-script=outbound-quickstart.sh
-    echo "Creating kafka-server instance"
-    aerolab client create none -n kafka-server -c $KAFKA_NODE_CT --disk=pd-ssd:110 --disk=local-ssd --instance $K_INSTANCE --zone $ZONE #--start-script=kafka-quickstart.sh
+
+    if [[ $OUTBOUND_NODE_CT -eq 0 && $KAFKA_NODE_CT -eq 0 ]]; then
+        echo "Skipping client creation. Got Outbound: $OUTBOUND_NODE_CT Kafka: $KAFKA_NODE_CT"
+    fi
+
+    if [[ $OUTBOUND_NODE_CT -gt 0 ]]; then
+        echo "Creating outbound-connector instance"
+        aerolab client create none -n outbound-connector -c $OUTBOUND_NODE_CT --disk=pd-ssd:110 --instance $O_INSTANCE --zone $ZONE
+    fi
+
+    if [[ $KAFKA_NODE_CT -gt 0 ]]; then
+        echo "Creating kafka-server instance"
+        aerolab client create none -n kafka-server -c $KAFKA_NODE_CT --disk=pd-ssd:110 --disk=local-ssd --instance $K_INSTANCE --zone $ZONE
+    fi
 }
+
 
 function createKafkaStartupScript {
     # Extract IP addresses using jq
@@ -114,7 +135,7 @@ function startServerAndZookeeper {
     else
         # Start Zookeeper
         echo "Starting Zookeeper server..."
-        nohup /kafka/bin/zookeeper-server-start.sh /kafka/config/zookeeper.properties > /var/log/kafka/zookeeper.log 2>&1 &
+        nohup /kafka/bin/zookeeper-server-start.sh /kafka/config/zookeeper.properties >> /var/log/kafka/zookeeper.log 2>&1 &
         sleep 5
 
         # Check if Zookeeper is running
@@ -134,7 +155,7 @@ function startServerAndZookeeper {
         if pgrep -f server.properties > /dev/null; then
             echo "Kafka is already running. Ignoring."
         else
-            nohup /kafka/bin/kafka-server-start.sh /kafka/config/server.properties > /var/log/kafka/kafka.log 2>&1 &
+            nohup /kafka/bin/kafka-server-start.sh /kafka/config/server.properties >> /var/log/kafka/kafka.log 2>&1 &
             sleep 10
 
             # Check if Kafka is running
@@ -143,7 +164,7 @@ function startServerAndZookeeper {
             else
                 echo "Kafka didn't seem to start... Retrying in 5 seconds..."
                 sleep 5
-                nohup /kafka/bin/kafka-server-start.sh /kafka/config/server.properties > /var/log/kafka/kafka.log 2>&1 &
+                nohup /kafka/bin/kafka-server-start.sh /kafka/config/server.properties >> /var/log/kafka/kafka.log 2>&1 &
                 sleep 5
                 if pgrep -f server.properties > /dev/null; then
                     echo "Kafka started successfully on retry. PID: \$(pgrep -f server.properties)"
@@ -231,16 +252,54 @@ function createOutboundStartupScript {
     producers_string=$(IFS=$'\n'; echo "${producers[*]}")
         cat <<EOF >outbound-quickstart.sh
 #!/bin/bash
-function configureEnv {
-	apt update && apt install -y default-jre curl wget
-	#wget https://download.aerospike.com/artifacts/enterprise/aerospike-kafka-outbound/5.0.1/aerospike-kafka-outbound-5.0.1.all.deb
-    wget https://download.aerospike.com/artifacts/enterprise/aerospike-kafka-outbound/5.3.1/aerospike-kafka-outbound-5.3.1.all.deb
-	#apt install ./aerospike-kafka-outbound-5.0.1.all.deb
-    apt install ./aerospike-kafka-outbound-5.3.1.all.deb
-	touch /opt/outbound_installed
+function getLatestOutboundURL {
+    base_url="https://download.aerospike.com/artifacts/enterprise/aerospike-kafka-outbound/"
+    # Get the latest version directory
+    latest_version=\$(curl -s "\$base_url" | grep -oE '>[0-9]+\.[0-9]+\.[0-9]+/<' | tr -d '/<>' | sort -rV | head -n 1)
+    
+    # Construct the URL for the latest .deb file
+    outbound_url="\${base_url}\${latest_version}/aerospike-kafka-outbound-\${latest_version}.all.deb"
+    
+    echo "\$outbound_url"
 }
 
+function configureEnv {
+    if [ -f /opt/outbound_installed ]; then
+        echo "Outbound already installed. Continuing."
+        return
+    fi
+
+    apt update && apt install -y default-jre curl wget
+
+    # Get the latest outbound URL
+    outbound_url=\$(getLatestOutboundURL)
+
+    # Download the latest version
+    echo "Downloading the latest Aerospike Kafka Outbound package..."
+    wget -O aerospike-kafka-outbound-latest.deb "\$outbound_url"
+
+    if [ \$? -ne 0 ]; then
+        echo "Error: Failed to download the Aerospike Kafka Outbound package."
+        exit 1
+    fi
+
+    # Install the downloaded package
+    echo "Installing the Aerospike Kafka Outbound package..."
+    apt install -y ./aerospike-kafka-outbound-latest.deb
+
+    if [ \$? -ne 0 ]; then
+        echo "Error: Failed to install the Aerospike Kafka Outbound package."
+        exit 1
+    fi
+
+    # Mark as installed
+    touch /opt/outbound_installed
+    echo "Aerospike Kafka Outbound package installed successfully."
+}
+
+
 function createOutboundYaml {
+    echo "Creating /etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml!"
     cat <<EOF2 >/etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml
 # Change the configuration for your use case.
 #
@@ -250,6 +309,7 @@ function createOutboundYaml {
 # The connector's listening ports, TLS and network interface.
 service:
   port: 8080
+  worker-threads: 16
 
 # Format of the Kafka destination message.
 format:
@@ -259,8 +319,13 @@ format:
 # Aerospike record routing to a Kafka destination.
 
 # Kafka producer initialization properties.
+# https://kafka.apache.org/28/documentation.html#producerconfigs
 producer-props:
   request.timeout.ms: 3000
+  delivery.timeout.ms: 5000
+  #connections.max.idle.ms: 5000
+  retries: 0
+  #max.in.flight.requests.per.connection: 1000
   bootstrap.servers:
 $producers_string
 
@@ -290,13 +355,12 @@ EOF2
 }
 
 function startOutbound {
-    out_running=\$(pgrep -f aerospike-kafka-outbound)
-    if [ -n "\$out_running" ]; then
+    if pgrep -f aerospike-kafka-outbound > /dev/null; then
         echo "Connector is already running. Exiting."
-        exit 0
+        return
     fi
     
-    nohup /opt/aerospike-kafka-outbound/bin/aerospike-kafka-outbound -f /etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml > /var/log/aerospike-kafka-outbound/aerospike-kafka-outbound.log 2>&1 &
+    nohup /opt/aerospike-kafka-outbound/bin/aerospike-kafka-outbound -f /etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml >> /var/log/aerospike-kafka-outbound/aerospike-kafka-outbound.log 2>&1 &
 
     # Wait a bit to ensure outbound starts
     sleep 5
@@ -307,7 +371,7 @@ function startOutbound {
     else
         echo "Outbound connector didn't seem to start... Retrying in 5 seconds..."
         sleep 5
-        nohup /opt/aerospike-kafka-outbound/bin/aerospike-kafka-outbound -f /etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml > /var/log/aerospike-kafka-outbound/aerospike-kafka-outbound.log 2>&1 &
+        nohup /opt/aerospike-kafka-outbound/bin/aerospike-kafka-outbound -f /etc/aerospike-kafka-outbound/aerospike-kafka-outbound.yaml >> /var/log/aerospike-kafka-outbound/aerospike-kafka-outbound.log 2>&1 &
         sleep 5
         if pgrep -f aerospike-kafka-outbound > /dev/null; then
             echo "Outbound Connector started successfully on retry. PID: \$(pgrep -f aerospike-kafka-outbound)"
@@ -329,7 +393,7 @@ function main {
         stop)
             pid=\$(pgrep -f aerospike-kafka-outbound)
             echo "Stopping aerospike-kafka-outbound PID: \$pid"
-            pkill -SIGTERM \$pid
+            kill -9 \$pid
             ;;
         restart)
             pid=\$(pgrep -f aerospike-kafka-outbound)
@@ -350,8 +414,15 @@ EOF
 }
 
 function uploadFiles {
-    aerolab files upload -c -n kafka-server -lall kafka-quickstart.sh /opt/
-    aerolab files upload -c -n outbound-connector -lall outbound-quickstart.sh /opt/
+    if [[ $KAFKA_NODE_CT -gt 0 ]]; then
+        echo "Uploading kafka-quickstart.sh to Kafka servers..."
+        aerolab files upload -c -n kafka-server -lall kafka-quickstart.sh /opt/
+    fi
+
+    if [[ $OUTBOUND_NODE_CT -gt 0 ]]; then
+        echo "Uploading outbound-quickstart.sh to outbound connectors..."
+        aerolab files upload -c -n outbound-connector -lall outbound-quickstart.sh /opt/
+    fi
 }
 
 function runInstallerScripts {
@@ -366,20 +437,35 @@ function runInstallerScripts {
         [[ $OUTBOUND_NODE_CT -gt 0 ]] && aerolab client attach -l "$(($OUTBOUND_DEPLOYED_CT+1))-$(($OUTBOUND_DEPLOYED_CT+$OUTBOUND_NODE_CT))" --parallel -n outbound-connector -- bash /opt/outbound-quickstart.sh start
         return
     fi
-    aerolab client attach -lall --parallel -n kafka-server -- bash /opt/kafka-quickstart.sh deploy
-    aerolab client attach -lall --parallel -n kafka-server -- bash /opt/kafka-quickstart.sh start
-    aerolab client attach -lall --parallel -n outbound-connector -- bash /opt/outbound-quickstart.sh deploy
-    aerolab client attach -lall --parallel -n outbound-connector -- bash /opt/outbound-quickstart.sh start
+
+    if [[ $KAFKA_NODE_CT -gt 0 ]]; then
+        aerolab client attach -lall --parallel -n kafka-server -- bash /opt/kafka-quickstart.sh deploy
+        aerolab client attach -lall --parallel -n kafka-server -- bash /opt/kafka-quickstart.sh start
+    fi
+    if [[ $OUTBOUND_NODE_CT -gt 0 ]]; then
+        aerolab client attach -lall --parallel -n outbound-connector -- bash /opt/outbound-quickstart.sh deploy
+        aerolab client attach -lall --parallel -n outbound-connector -- bash /opt/outbound-quickstart.sh start
+    fi
 }
 
 function recreateFiles {
+    echo "Recreating files..."
+    INVENTORY=$(aerolab inventory list -j)
+    OUTBOUND_DEPLOYED_CT=$(jq -r '.Clients[] | select(.ClientName | contains("outbound-connector")).PrivateIp' <<< "$INVENTORY" | wc -l)
+    KAFKA_DEPLOYED_CT=$(jq -r '.Clients[] | select(.ClientName | contains("kafka-server")).PrivateIp' <<< "$INVENTORY" | wc -l)
+
+    if [[ $OUTBOUND_DEPLOYED_CT -eq 0 && $KAFKA_DEPLOYED_CT -eq 0 ]]; then
+        echo "ERROR: Failed to find any kafka-server or outbound-connector clients. Skipping file recreation."
+        exit 1
+    fi
+
     echo "Deleting old installer scripts."
     aerolab client attach -lall --parallel -n kafka-server -- rm /opt/kafka-quickstart.sh
     aerolab client attach -lall --parallel -n outbound-connector -- rm /opt/outbound-quickstart.sh
-    echo "Recreating files..."
-    INVENTORY=$(aerolab inventory list -j)
-    createOutboundStartupScript
-    createKafkaStartupScript
+
+
+    [[ $OUTBOUND_DEPLOYED_CT -gt 0 ]] && createOutboundStartupScript
+    [[ $KAFKA_DEPLOYED_CT -gt 0 ]] && createKafkaStartupScript
     uploadFiles
     echo "Done."
 }
@@ -483,16 +569,30 @@ EOF
         done
         exit 0
     fi
-    echo "Creating Aerospike Cluster!"
-    aerolab cluster create -n $CLUSTER_NAME -c $CLUSTER_NODE_CT --instance c2d-highcpu-8 --zone $ZONE --disk=pd-ssd:110 --disk=local-ssd --start n -o aerospike.conf -v '7.0*' -d ubuntu -i 22.04
-    aerolab cluster partition create -n $CLUSTER_NAME --filter-type=nvme -p 24,24,24,24
-    aerolab cluster partition conf -n $CLUSTER_NAME --filter-type=nvme --filter-partitions=1-4 --namespace test --configure=device
-    aerolab aerospike start -n $CLUSTER_NAME
-    sleep 5
-    aerolab roster apply -n $CLUSTER_NAME -m test
+    if [[ $CLUSTER_NODE_CT -gt 0 ]]; then
+        echo "Creating Aerospike Cluster!"
+        aerolab cluster create -n $CLUSTER_NAME -c $CLUSTER_NODE_CT --instance c2d-highcpu-8 --zone $ZONE --disk=pd-ssd:110 --disk=local-ssd --start n -o aerospike.conf -v '7.0*' -d ubuntu -i 22.04
+        aerolab cluster partition create -n $CLUSTER_NAME --filter-type=nvme -p 24,24,24,24
+        aerolab cluster partition conf -n $CLUSTER_NAME --filter-type=nvme --filter-partitions=1-4 --namespace test --configure=device
+        aerolab aerospike start -n $CLUSTER_NAME
+        sleep 5
+        aerolab roster apply -n $CLUSTER_NAME -m test
+    fi
+}
+
+function getLogs {
+    if [ -d $DIR ]; then
+        echo "$DIR already exists. Please rename or remove existing directory."
+        return
+    fi
+    aerolab logs get -c -nkafka-server -d "$DIR/connectors/kafka" -p /var/log/kafka/kafka.log
+    aerolab logs get -c -nkafka-server -d "$DIR/connectors/zookeeper" -p /var/log/kafka/zookeeper.log
+    aerolab logs get -c -noutbound-connector -d "$DIR/connectors/outbound" -p /var/log/aerospike-kafka-outbound/aerospike-kafka-outbound.log
+    aerolab logs get -n $CLUSTER_NAME -d "$DIR/aerospike"
 }
 
 function cleanUp {
+    set +o errexit
     aerolab client destroy -f -n outbound-connector
     aerolab client destroy -f -n kafka-server
     aerolab cluster destroy -f -n $CLUSTER_NAME
@@ -500,18 +600,20 @@ function cleanUp {
 }
 
 function usage {
-    echo "Usage: $0 [ -n CLUSTER_NAME ] [ -c NUM_AEROSPIKE_NODES ] [ -k NUM_KAFKA_NODES ] [ -o NUM_OUTBOUND_NODES ] [ -R ] [ -f ] [ -h ]"
+    echo "Usage: $0 [ -n CLUSTER_NAME ] [ -c NUM_AEROSPIKE_NODES ] [ -k NUM_KAFKA_NODES ] [ -o NUM_OUTBOUND_NODES ] [ -I INSTANCE_TYPE ] [ -O INSTANCE_TYPE ] [ -R ] [ -L ] [ -f ] [ -g ] [ -h ]"
     echo ""
-    echo "-c) Number of Aerospike Server DB nodes (Default: 1)"
-    echo "-k) Number of Kafka Broker nodes (Default: 1)"
-    echo "-o) Number of Outbound Connector nodes (Default: 1)"
-    echo "-I) Instance type for kafka-servers (Default: c2d-highcpu-8)"
-    echo "-O) Instance type for outbound-connectors (Default: c2d-highcpu-8)"
-    echo "-n) Name of aerolab cluster to configure DC to ship to outbound connector (Default: mydc)"
-    echo "-R) Clean up clients and clusters deployed"
-    echo "-f) Recreate files"
-    echo "-g) Grow the instances horizontally. MUST have already running instances."
-    echo "-h) Display this help message"
+    echo "Options:"
+    echo "  -c  Number of Aerospike Server DB nodes (Default: 1)"
+    echo "  -k  Number of Kafka Broker nodes (Default: 1)"
+    echo "  -o  Number of Outbound Connector nodes (Default: 1)"
+    echo "  -I  Instance type for Kafka servers (Default: c2d-highcpu-8)"
+    echo "  -O  Instance type for outbound connectors (Default: c2d-highcpu-8)"
+    echo "  -n  Name of Aerolab cluster to configure DC to ship to outbound connector (Default: mydc)"
+    echo "  -R  Clean up clients and clusters deployed"
+    echo "  -L  Gather logs from all instances and store in the specified directory (Default: ./logs/)"
+    echo "  -f  Recreate files"
+    echo "  -g  Grow the instances horizontally (MUST have already running instances)"
+    echo "  -h  Display this help message"
     exit 0
 }
 
@@ -534,8 +636,10 @@ function parseArgs {
     K_INSTANCE="c2d-highcpu-8"
     O_INSTANCE="c2d-highcpu-8"
     ZONE="us-central1-a"
+    DIR="./logs/"
+    GET_LOGS=0
 
-    while getopts ":n:c:k:o:O:I:z:Rfgh" options; do
+    while getopts ":n:c:k:o:O:I:z:d:lRfgh" options; do
         case "${options}" in
             n)
                 CLUSTER_NAME=${OPTARG}
@@ -567,6 +671,12 @@ function parseArgs {
             g)
                 GROW=1
                 ;;
+            d)
+                DIR=${OPTARG}
+                ;;
+            l)
+                GET_LOGS=1
+                ;;
             h)
                 ERROR=1
                 ;;
@@ -581,14 +691,14 @@ function parseArgs {
         esac
     done
     ERROR_MSG=$(echo "$ERROR_MSG" | tr -d '"')
-    echo "$CLUSTER_NAME $CLUSTER_NODE_CT $KAFKA_NODE_CT $OUTBOUND_NODE_CT $CLEAN_UP $RECREATE_FILES $GROW $ERROR $K_INSTANCE $O_INSTANCE $ZONE $ERROR_MSG"
+    echo "$CLUSTER_NAME $CLUSTER_NODE_CT $KAFKA_NODE_CT $OUTBOUND_NODE_CT $CLEAN_UP $RECREATE_FILES $GROW $ERROR $K_INSTANCE $O_INSTANCE $ZONE $DIR $GET_LOGS $ERROR_MSG"
 }
 
 function main {
     # Capture the output of parseArgs
     parsed_args=$(parseArgs "$@")
     # Read the parsed arguments into variables
-    read -r CLUSTER_NAME CLUSTER_NODE_CT KAFKA_NODE_CT OUTBOUND_NODE_CT CLEAN_UP RECREATE_FILES GROW ERROR K_INSTANCE O_INSTANCE ZONE ERROR_MSG <<< "$parsed_args"
+    read -r CLUSTER_NAME CLUSTER_NODE_CT KAFKA_NODE_CT OUTBOUND_NODE_CT CLEAN_UP RECREATE_FILES GROW ERROR K_INSTANCE O_INSTANCE ZONE DIR GET_LOGS ERROR_MSG <<< "$parsed_args"
 
     # Check if we triggered an error
     if [[ $ERROR -eq 1 ]]; then
@@ -597,7 +707,7 @@ function main {
     fi
 
     # Validate cluster name
-    for arg in "$CLUSTER_NAME" "$K_INSTANCE" "$O_INSTANCE" "$ZONE"; do
+    for arg in "$CLUSTER_NAME" "$K_INSTANCE" "$O_INSTANCE" "$ZONE" "$DIR"; do
         if [[ -z "$arg" ]]; then
             echo "Error: $arg cannot be empty."
             exit_abnormal
@@ -612,40 +722,43 @@ function main {
         fi
     done
 
-
-
+    echo "Checking for required tools..."
     which aerolab > /dev/null || { echo "aerolab is not installed"; exit 1; }
     which jq > /dev/null || { echo "jq is not installed"; exit 1; }
 
-    if [[ $RECREATE_FILES -eq 1 ]]; then 
-        recreateFiles
-        exit 0
-    fi
-
-    if [[ $CLEAN_UP -eq 1 ]]; then
-        cleanUp
-        exit 0
-    fi
+    [[ $RECREATE_FILES -eq 1 ]] && { recreateFiles; exit 0; }
+    [[ $CLEAN_UP -eq 1 ]] && { cleanUp; exit 0; }
+    [[ $GET_LOGS -eq 1 ]] && { getLogs; exit 0; }
 
     createOutboundAndKafkaClient
+
+    echo "Fetching inventory..."
     INVENTORY=$(aerolab inventory list -j)
 
+    echo "Creating Kafka startup script..."
     createKafkaStartupScript
+
+    echo "Creating outbound startup script..."
     createOutboundStartupScript
 
-    echo "Uploading install scripts!"
+    echo "Uploading install scripts..."
     uploadFiles
-    echo "Running deployment installers!"
+
+    echo "Running deployment installers..."
     runInstallerScripts
 
-    deployAerospikeCluster $OUTBOUND_NODE_CT
-    echo "Configured XDR DC to outbound connector"
+    if [[ $CLUSTER_NODE_CT -gt 0 ]]; then
+        echo "Deploying Aerospike cluster..."
+        deployAerospikeCluster $OUTBOUND_NODE_CT
+    fi
+    
 
-    echo "Finished setting up Kafka and Outbound clients."
-    echo ""
-    echo "To verify records are shipping correctly insert data with aerolab and start a consumer:"
-    echo "-    aerolab data insert -m test -s myset -z 10"
-    echo "-    aerolab client attach -n kafka-server -- /kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic test_topic --from-beginning"
+    if [[ $CLUSTER_NODE_CT -gt 0 && $KAFKA_NODE_CT -gt 0 ]]; then
+        echo "Configured XDR DC to outbound connector"
+        echo "To verify records are shipping correctly, insert data with aerolab and start a consumer:"
+        echo "-    aerolab data insert -n $CLUSTER_NAME -m test -s myset -z 10"
+        echo "-    aerolab client attach -n kafka-server -- /kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic first_kafka_topic --from-beginning"
+    fi
 }
 
 main "$@"
