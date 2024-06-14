@@ -581,9 +581,10 @@ EOF
 }
 
 function getLogs {
+    set +o errexit
     if [ -d $DIR ]; then
         echo "$DIR already exists. Please rename or remove existing directory."
-        return
+        exit 1
     fi
     aerolab logs get -c -nkafka-server -d "$DIR/connectors/kafka" -p /var/log/kafka/kafka.log
     aerolab logs get -c -nkafka-server -d "$DIR/connectors/zookeeper" -p /var/log/kafka/zookeeper.log
@@ -639,7 +640,7 @@ function parseArgs {
     DIR="./logs/"
     GET_LOGS=0
 
-    while getopts ":n:c:k:o:O:I:z:d:lRfgh" options; do
+    while getopts ":n:c:k:o:O:I:z:d:LRfgh" options; do
         case "${options}" in
             n)
                 CLUSTER_NAME=${OPTARG}
@@ -674,7 +675,7 @@ function parseArgs {
             d)
                 DIR=${OPTARG}
                 ;;
-            l)
+            L)
                 GET_LOGS=1
                 ;;
             h)
